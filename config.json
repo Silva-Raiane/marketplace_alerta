@@ -1,0 +1,25 @@
+{
+  "local": "portovelho",
+  "raio_km": 10,
+  "palavras_excluir": ["compro", "procuro", "busco", "quero comprar"],
+  "buscas": [
+    {
+      "nome": "PS2",
+      "termos_busca": ["ps2", "playstation 2", "play 2"],
+      "titulo_deve_conter": ["ps2", "ps 2", "playstation 2", "playstation2", "play 2", "play2"],
+      "preco_max": null
+    },
+    {
+      "nome": "Roçadeira",
+      "termos_busca": ["roçadeira"],
+      "titulo_deve_conter": ["rocadeira", "rocadera"],
+      "preco_max": null
+    },
+    {
+      "nome": "Xbox 360",
+      "termos_busca": ["xbox 360"],
+      "titulo_deve_conter": ["xbox 360", "xbox360"],
+      "preco_max": null
+    }
+  ]
+}
