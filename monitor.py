@@ -182,8 +182,10 @@ def buscar(sessao: requests.Session, url: str) -> tuple[list[dict], bool]:
 # --------------------------------------------------------------------------- #
 # Filtros
 # --------------------------------------------------------------------------- #
-def passa_filtro(anuncio: dict, busca: dict, excluir: list[str]) -> bool:
+def passa_filtro(anuncio: dict, busca: dict, excluir: list[str], cidades: list[str] | None = None) -> bool:
     titulo = normalizar(anuncio["titulo"])
+    if cidades and normalizar(anuncio["cidade"]) not in [normalizar(c) for c in cidades]:
+        return False
     if not any(normalizar(p) in titulo for p in busca.get("titulo_deve_conter", [])):
         return False
     if any(normalizar(p) in titulo for p in excluir):
@@ -208,6 +210,7 @@ def enviar(texto: str) -> bool:
                 timeout=30,
             )
             ok = r.status_code == 200
+            log(f"  WhatsApp (CallMeBot): {'ok' if ok else 'FALHOU'}")
             if not ok:
                 log(f"  CallMeBot respondeu {r.status_code}: {r.text[:120]}")
         except requests.RequestException as e:
@@ -240,6 +243,7 @@ def enviar(texto: str) -> bool:
                 timeout=30,
             )
             ok = ok or r.status_code == 200
+            log(f"  Telegram: {'ok' if r.status_code == 200 else 'FALHOU ' + r.text[:200]}")
         except requests.RequestException as e:
             log(f"  erro Telegram: {e}")
 
@@ -295,8 +299,11 @@ def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
             algum_bloqueio |= bloqueado
             lidos_busca += len(anuncios)
             total_lidos += len(anuncios)
+            if teste and anuncios:
+                cid = sorted({a["cidade"] for a in anuncios if a["cidade"]})[:6]
+                log(f"  cidades nos resultados: {', '.join(cid)}")
             for a in anuncios:
-                if passa_filtro(a, busca, config.get("palavras_excluir", [])):
+                if passa_filtro(a, busca, config.get("palavras_excluir", []), config.get("cidades_aceitas")):
                     encontrados[a["id"]] = a
             time.sleep(random.uniform(2, 5))
 
@@ -306,7 +313,7 @@ def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
         if teste:
             for a in encontrados.values():
                 marca = "NOVO " if a in novos else "     "
-                print(f"   {marca}{a['preco_txt']:>12}  {a['titulo'][:60]}  {a['link']}")
+                print(f"   {marca}{a['preco_txt']:>12}  {a['cidade'][:18]:<18}  {a['titulo'][:55]}  {a['link']}")
             continue
 
         primeira_vez = nome not in estado["buscas_inicializadas"]
@@ -394,4 +401,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
