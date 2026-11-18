@@ -17,7 +17,8 @@ Variáveis de ambiente (no GitHub ficam em Settings > Secrets):
   GREENAPI_DESTINO  número que recebe, com DDI, ex: 5569999999999
   GREENAPI_URL      (opcional) apiUrl mostrada no console, ex: https://7103.api.greenapi.com
   TELEGRAM_TOKEN    (opcional) token do bot do Telegram
-  TELEGRAM_CHAT_ID  (opcional) chat id do Telegram
+  TELEGRAM_CHAT_ID  (opcional) chat id(s) fixos, separados por vírgula.
+                    Além deles, quem mandar /start no bot passa a receber (/parar sai).
   FB_COOKIES        (opcional) cookies de uma conta secundária, ex: "c_user=...; xs=...; datr=..."
 """
 
@@ -96,6 +97,8 @@ def estado_inicial() -> dict:
         "buscas_inicializadas": [],
         "falhas_seguidas": 0,
         "aviso_bloqueio_enviado": False,
+        "telegram_assinantes": [],
+        "telegram_offset": 0,
     }
 
 
@@ -120,6 +123,67 @@ def _percorrer(obj, achados: dict) -> None:
     elif isinstance(obj, list):
         for v in obj:
             _percorrer(v, achados)
+
+
+CAMPOS_DATA = ("creation_time", "created_time", "listing_creation_time", "publish_time")
+
+
+def _achar_data(obj, profundidade: int = 0):
+    """Procura um timestamp de criação (segundos unix) dentro de um nó."""
+    if profundidade > 4:
+        return None
+    if isinstance(obj, dict):
+        for k in CAMPOS_DATA:
+            v = obj.get(k)
+            if isinstance(v, (int, float)) and 1_000_000_000 < v < 4_000_000_000:
+                return int(v)
+        for v in obj.values():
+            r = _achar_data(v, profundidade + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj[:20]:
+            r = _achar_data(v, profundidade + 1)
+            if r:
+                return r
+    return None
+
+
+def data_do_anuncio(sessao: requests.Session, anuncio: dict):
+    """Abre a página do anúncio e devolve o timestamp de publicação (ou None)."""
+    try:
+        r = sessao.get(anuncio["link"], headers=HEADERS, timeout=30)
+    except requests.RequestException:
+        return None
+    alvo = {}
+    for bloco in re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', r.text, re.S):
+        if anuncio["id"] not in bloco or "creation_time" not in bloco:
+            continue
+        try:
+            dados = json.loads(bloco)
+        except json.JSONDecodeError:
+            continue
+
+        def andar(o):
+            if alvo:
+                return
+            if isinstance(o, dict):
+                if str(o.get("id")) == anuncio["id"]:
+                    ts = _achar_data(o)
+                    if ts:
+                        alvo["ts"] = ts
+                        return
+                for v in o.values():
+                    andar(v)
+            elif isinstance(o, list):
+                for v in o:
+                    andar(v)
+        andar(dados)
+        if alvo:
+            return alvo["ts"]
+    # último recurso: primeiro creation_time da página (normalmente é o do próprio anúncio)
+    m = re.search(r'"creation_time"\s*:\s*(\d{10})', r.text)
+    return int(m.group(1)) if m else None
 
 
 def extrair_anuncios(html: str) -> list[dict]:
@@ -156,6 +220,7 @@ def extrair_anuncios(html: str) -> list[dict]:
             "cidade": local.get("city") or "",
             "foto": foto,
             "link": f"https://www.facebook.com/marketplace/item/{id_}/",
+            "criado_em": _achar_data(n),
         })
     return anuncios
 
@@ -202,6 +267,60 @@ def passa_filtro(anuncio: dict, busca: dict, excluir: list[str], cidades: list[s
 # --------------------------------------------------------------------------- #
 # Notificações
 # --------------------------------------------------------------------------- #
+# lista de quem mandou /start no bot (carregada do estado.json a cada rodada)
+TELEGRAM_ASSINANTES: list[str] = []
+
+
+def telegram_destinos() -> list[str]:
+    """IDs fixos do secret TELEGRAM_CHAT_ID (pode ter vírgulas) + assinantes do /start."""
+    fixos = [c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
+    return list(dict.fromkeys(fixos + TELEGRAM_ASSINANTES))
+
+
+def telegram_responder(token: str, chat: str, texto: str) -> None:
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data={"chat_id": chat, "text": texto}, timeout=30)
+    except requests.RequestException:
+        pass
+
+
+def atualizar_assinantes(estado: dict) -> None:
+    """Lê as mensagens novas do bot: /start inscreve, /parar remove."""
+    global TELEGRAM_ASSINANTES
+    TELEGRAM_ASSINANTES = [str(c) for c in estado.get("telegram_assinantes", [])]
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        return
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
+                         params={"offset": estado.get("telegram_offset", 0), "timeout": 0},
+                         timeout=30).json()
+    except (requests.RequestException, ValueError) as e:
+        log(f"  erro lendo mensagens do bot: {e}")
+        return
+    for u in r.get("result", []):
+        estado["telegram_offset"] = u["update_id"] + 1
+        msg = u.get("message") or {}
+        chat = str((msg.get("chat") or {}).get("id", ""))
+        texto = (msg.get("text") or "").strip().lower()
+        if not chat:
+            continue
+        nome = (msg.get("chat") or {}).get("first_name", "")
+        if texto.startswith("/start"):
+            if chat not in TELEGRAM_ASSINANTES:
+                TELEGRAM_ASSINANTES.append(chat)
+                log(f"  novo assinante no Telegram: {nome} ({chat})")
+            telegram_responder(token, chat,
+                "✅ Pronto! Você vai receber os alertas de novos anúncios do Marketplace.\n"
+                "Para parar, mande /parar.")
+        elif texto.startswith(("/parar", "/stop")):
+            if chat in TELEGRAM_ASSINANTES:
+                TELEGRAM_ASSINANTES.remove(chat)
+            telegram_responder(token, chat, "🔕 Você não vai mais receber alertas. Para voltar, mande /start.")
+    estado["telegram_assinantes"] = TELEGRAM_ASSINANTES
+
+
 def enviar(texto: str) -> bool:
     ok = False
     phone, apikey = os.getenv("CALLMEBOT_PHONE"), os.getenv("CALLMEBOT_APIKEY")
@@ -237,8 +356,9 @@ def enviar(texto: str) -> bool:
             log(f"  erro Green-API: {e}")
         time.sleep(2)
 
-    token, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if token and chat:
+    token = os.getenv("TELEGRAM_TOKEN")
+    chats = telegram_destinos()
+    for chat in chats if token else []:
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
@@ -246,14 +366,24 @@ def enviar(texto: str) -> bool:
                 timeout=30,
             )
             ok = ok or r.status_code == 200
-            log(f"  Telegram: {'ok' if r.status_code == 200 else 'FALHOU ' + r.text[:200]}")
+            log(f"  Telegram {chat}: {'ok' if r.status_code == 200 else 'FALHOU ' + r.text[:200]}")
+            if r.status_code == 403 and chat in TELEGRAM_ASSINANTES:  # bloqueou o bot
+                TELEGRAM_ASSINANTES.remove(chat)
         except requests.RequestException as e:
             log(f"  erro Telegram: {e}")
+        time.sleep(0.5)
 
-    if not (phone and apikey) and not (token and chat) and not (g_id and g_token and g_dest):
+    if not (phone and apikey) and not (token and chats) and not (g_id and g_token and g_dest):
         log("  (nenhum canal configurado — mensagem só no log)")
         print(texto)
     return ok
+
+
+def fmt_data(ts) -> str:
+    if not ts:
+        return "data ?"
+    from datetime import timedelta
+    return datetime.fromtimestamp(ts, timezone(timedelta(hours=-3))).strftime("%d/%m %H:%M")
 
 
 def formatar(anuncio: dict, nome_busca: str) -> str:
@@ -264,6 +394,8 @@ def formatar(anuncio: dict, nome_busca: str) -> str:
     ]
     if anuncio["cidade"]:
         linhas.append(f"📍 {anuncio['cidade']}")
+    if anuncio.get("criado_em"):
+        linhas.append(f"🕒 publicado {fmt_data(anuncio['criado_em'])}")
     linhas.append(anuncio["link"])
     return "\n".join(linhas)
 
@@ -278,6 +410,8 @@ def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
     estado = carregar_json(ARQ_ESTADO, estado_inicial())
     for k, v in estado_inicial().items():
         estado.setdefault(k, v)
+    if not teste:
+        atualizar_assinantes(estado)
 
     sessao = requests.Session()
     cookies = os.getenv("FB_COOKIES", "").strip()
@@ -289,6 +423,22 @@ def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
         log("usando cookies de conta (FB_COOKIES)")
 
     agora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    limite_data = None
+    if config.get("publicado_apos"):
+        limite_data = datetime.fromisoformat(config["publicado_apos"]).timestamp()
+    idade_max = config.get("idade_maxima_horas")
+    enviar_sem_data = config.get("enviar_quando_sem_data", True)
+
+    def recente(a: dict) -> bool:
+        ts = a.get("criado_em")
+        if ts is None:
+            return enviar_sem_data
+        if limite_data and ts < limite_data:
+            return False
+        if idade_max and time.time() - ts > idade_max * 3600:
+            return False
+        return True
+
     total_lidos, algum_bloqueio, a_notificar = 0, False, []
 
     for busca in config["buscas"]:
@@ -314,18 +464,36 @@ def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
         log(f"{nome}: {len(encontrados)} relevantes, {len(novos)} novos")
 
         if teste:
-            for a in encontrados.values():
+            # no teste, busca a data só dos 3 primeiros (para conferir se o Facebook informa)
+            for i, a in enumerate(encontrados.values()):
+                if a["criado_em"] is None and i < 3:
+                    a["criado_em"] = data_do_anuncio(sessao, a)
+                    time.sleep(random.uniform(1, 3))
                 marca = "NOVO " if a in novos else "     "
-                print(f"   {marca}{a['preco_txt']:>12}  {a['cidade'][:18]:<18}  {a['titulo'][:55]}  {a['link']}")
+                print(f"   {marca}{a['preco_txt']:>12}  {fmt_data(a['criado_em']):<16}  "
+                      f"{a['cidade'][:15]:<15}  {a['titulo'][:50]}  {a['link']}")
             continue
+
+        # data de publicação: só para os novos (poucos por rodada)
+        if limite_data or idade_max:
+            for a in novos:
+                if a["criado_em"] is None:
+                    a["criado_em"] = data_do_anuncio(sessao, a)
+                    time.sleep(random.uniform(1, 3))
+            antes = len(novos)
+            novos_recentes = [a for a in novos if recente(a)]
+            if antes != len(novos_recentes):
+                log(f"  {antes - len(novos_recentes)} ignorados por serem antigos")
+        else:
+            novos_recentes = novos
 
         primeira_vez = nome not in estado["buscas_inicializadas"]
         if enviar_atuais:  # manda tudo que está anunciado agora, mesmo o que já foi visto
             a_notificar.extend((a, nome) for a in encontrados.values())
         for a in novos:
             estado["vistos"][a["id"]] = agora
-            if not primeira_vez and not enviar_atuais:
-                a_notificar.append((a, nome))
+        if not primeira_vez and not enviar_atuais:
+            a_notificar.extend((a, nome) for a in novos_recentes)
         if primeira_vez and lidos_busca:
             estado["buscas_inicializadas"].append(nome)
             log(f"  primeira execução de '{nome}': {len(novos)} anúncios antigos marcados como vistos")
@@ -358,6 +526,7 @@ def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
         estado["falhas_seguidas"] = 0
         estado["aviso_bloqueio_enviado"] = False
 
+    estado["telegram_assinantes"] = TELEGRAM_ASSINANTES
     salvar_estado(estado)
     log(f"fim: {total_lidos} lidos, {len(a_notificar)} notificados")
 
@@ -388,6 +557,9 @@ def main() -> None:
             print(f"TELEGRAM_CHAT_ID = {cid}   ({nome})")
         return
     if args.testar_whatsapp:
+        global TELEGRAM_ASSINANTES
+        estado = carregar_json(ARQ_ESTADO, estado_inicial())
+        TELEGRAM_ASSINANTES = [str(c) for c in estado.get("telegram_assinantes", [])]
         print("enviado" if enviar("✅ Teste do monitor do Marketplace") else "falhou")
         return
     if args.loop:
