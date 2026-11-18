@@ -1,5 +1,5 @@
 {
-  "local": "portovelho",
+  "local": ["portovelho", "108549759176811"],
   "raio_km": 10,
   "palavras_excluir": ["compro", "procuro", "busco", "quero comprar"],
   "buscas": [
