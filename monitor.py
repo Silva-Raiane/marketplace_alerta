@@ -264,7 +264,7 @@ def formatar(anuncio: dict, nome_busca: str) -> str:
 # --------------------------------------------------------------------------- #
 # Rodada principal
 # --------------------------------------------------------------------------- #
-def rodar(teste: bool = False) -> None:
+def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
     config = carregar_json(ARQ_CONFIG, None)
     if not config:
         sys.exit("config.json não encontrado")
@@ -310,9 +310,11 @@ def rodar(teste: bool = False) -> None:
             continue
 
         primeira_vez = nome not in estado["buscas_inicializadas"]
+        if enviar_atuais:  # manda tudo que está anunciado agora, mesmo o que já foi visto
+            a_notificar.extend((a, nome) for a in encontrados.values())
         for a in novos:
             estado["vistos"][a["id"]] = agora
-            if not primeira_vez:
+            if not primeira_vez and not enviar_atuais:
                 a_notificar.append((a, nome))
         if primeira_vez and lidos_busca:
             estado["buscas_inicializadas"].append(nome)
@@ -325,9 +327,11 @@ def rodar(teste: bool = False) -> None:
         return
 
     # notificações
-    for a, nome in a_notificar[:MAX_NOTIFICACOES_POR_RODADA]:
+    limite = len(a_notificar) if enviar_atuais else MAX_NOTIFICACOES_POR_RODADA
+    for a, nome in a_notificar[:limite]:
         enviar(formatar(a, nome))
-    if len(a_notificar) > MAX_NOTIFICACOES_POR_RODADA:
+        time.sleep(1)  # Telegram limita rajadas
+    if len(a_notificar) > limite:
         enviar(f"(+{len(a_notificar) - MAX_NOTIFICACOES_POR_RODADA} anúncios novos não enviados nesta rodada)")
 
     # saúde do monitor
@@ -351,6 +355,8 @@ def rodar(teste: bool = False) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--teste", action="store_true", help="não salva nem notifica")
+    ap.add_argument("--enviar-atuais", action="store_true",
+                    help="envia TODOS os anúncios relevantes que estão no ar agora")
     ap.add_argument("--loop", type=float, metavar="MIN", help="repete a cada MIN minutos")
     ap.add_argument("--testar-whatsapp", action="store_true", help="manda mensagem de teste (WhatsApp/Telegram)")
     ap.add_argument("--descobrir-chat-id", action="store_true", help="mostra o chat id de quem falou com o bot")
@@ -383,8 +389,9 @@ def main() -> None:
             espera = args.loop * 60 + random.uniform(-30, 30)
             time.sleep(max(60, espera))
     else:
-        rodar(teste=args.teste)
+        rodar(teste=args.teste, enviar_atuais=args.enviar_atuais)
 
 
 if __name__ == "__main__":
     main()
+
