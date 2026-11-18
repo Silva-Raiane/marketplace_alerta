@@ -190,6 +190,9 @@ def passa_filtro(anuncio: dict, busca: dict, excluir: list[str], cidades: list[s
         return False
     if any(normalizar(p) in titulo for p in excluir):
         return False
+    pmin = busca.get("preco_min")
+    if pmin is not None and anuncio["preco"] is not None and anuncio["preco"] < pmin:
+        return False
     pmax = busca.get("preco_max")
     if pmax is not None and anuncio["preco"] is not None and anuncio["preco"] > pmax:
         return False
