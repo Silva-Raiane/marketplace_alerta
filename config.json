@@ -12,6 +12,9 @@
     "quero comprar",
     "querendo"
   ],
+  "publicado_apos": "2026-11-18T13:00:00-03:00",
+  "idade_maxima_horas": 24,
+  "enviar_quando_sem_data": true,
   "buscas": [
     {
       "nome": "PS2",
