@@ -1,11 +1,11 @@
 {
- "aviso_bloqueio_enviado": false,
+ "aviso_bloqueio_enviado": true,
  "buscas_inicializadas": [
   "PS2",
   "Roçadeira",
   "Xbox 360"
  ],
- "falhas_seguidas": 5,
+ "falhas_seguidas": 6,
  "telegram_assinantes": [
   "958546664",
   "5927691437"
