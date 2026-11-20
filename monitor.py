@@ -200,6 +200,10 @@ def extrair_anuncios(html: str) -> list[dict]:
         except json.JSONDecodeError:
             continue
 
+    return montar_anuncios(achados)
+
+
+def montar_anuncios(achados: dict) -> list[dict]:
     anuncios = []
     for id_, n in achados.items():
         if n.get("is_sold") or n.get("is_hidden"):
@@ -228,6 +232,88 @@ def extrair_anuncios(html: str) -> list[dict]:
 def parece_bloqueado(html: str, url_final: str) -> bool:
     sinais = ["/login/", "login_form", "checkpoint", "id=\"loginbutton\""]
     return any(s in url_final for s in sinais[:1]) or any(s in html for s in sinais[1:])
+
+
+# --------------------------------------------------------------------------- #
+# Modo SEM LOGIN: API interna (GraphQL) da busca, com latitude/longitude
+# --------------------------------------------------------------------------- #
+GRAPHQL_URL = "https://www.facebook.com/api/graphql/"
+_LSD: dict = {}
+
+
+def pegar_lsd(sessao: requests.Session) -> str:
+    """Token anti-CSRF que a página pública do Facebook entrega para visitantes."""
+    if "v" in _LSD:
+        return _LSD["v"]
+    try:
+        html = sessao.get("https://www.facebook.com/marketplace/", headers=HEADERS, timeout=30).text
+    except requests.RequestException:
+        html = ""
+    m = (re.search(r'"LSD",\[\],\{"token":"([^"]+)"', html)
+         or re.search(r'name="lsd" value="([^"]+)"', html))
+    _LSD["v"] = m.group(1) if m else "AVq5uabXj48"
+    return _LSD["v"]
+
+
+def buscar_graphql(sessao: requests.Session, config: dict, termo: str) -> tuple[list[dict], bool]:
+    g = config["sem_login"]
+    variaveis = {
+        "count": 24,
+        "params": {
+            "bqf": {"callsite": "COMMERCE_MKTPLACE_WWW", "query": termo},
+            "browse_request_params": {
+                "commerce_enable_local_pickup": True,
+                "commerce_enable_shipping": True,
+                "commerce_search_and_rp_available": True,
+                "commerce_search_and_rp_condition": None,
+                "commerce_search_and_rp_ctime_days": None,
+                "commerce_search_sort_by": "CREATION_TIME_DESCEND",
+                "filter_location_latitude": g["latitude"],
+                "filter_location_longitude": g["longitude"],
+                "filter_price_lower_bound": 0,
+                "filter_price_upper_bound": 214748364700,
+                "filter_radius_km": config.get("raio_km", 10),
+            },
+            "custom_request_params": {"surface": "SEARCH"},
+        },
+    }
+    lsd = pegar_lsd(sessao)
+    headers = dict(HEADERS)
+    headers.update({
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://www.facebook.com",
+        "Referer": "https://www.facebook.com/marketplace/",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "X-FB-LSD": lsd,
+        "X-FB-Friendly-Name": "CometMarketplaceSearchContentPaginationQuery",
+    })
+    dados = {
+        "av": "0", "__user": "0", "__a": "1", "lsd": lsd,
+        "fb_api_caller_class": "RelayModern",
+        "fb_api_req_friendly_name": "CometMarketplaceSearchContentPaginationQuery",
+        "server_timestamps": "true",
+        "variables": json.dumps(variaveis),
+        "doc_id": str(g["doc_id"]),
+    }
+    try:
+        r = sessao.post(GRAPHQL_URL, headers=headers, data=dados, timeout=30)
+    except requests.RequestException as e:
+        log(f"  erro de rede: {e}")
+        return [], False
+    achados: dict = {}
+    texto = r.text.removeprefix("for (;;);")
+    for linha in texto.splitlines():
+        try:
+            _percorrer(json.loads(linha), achados)
+        except json.JSONDecodeError:
+            continue
+    anuncios = montar_anuncios(achados)
+    if not anuncios:
+        log(f"  GraphQL status {r.status_code}: {texto[:250]}")
+    return anuncios, (not anuncios and r.status_code in (401, 403))
+
 
 
 def buscar(sessao: requests.Session, url: str) -> tuple[list[dict], bool]:
@@ -421,6 +507,8 @@ def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
                 k, v = par.strip().split("=", 1)
                 sessao.cookies.set(k, v, domain=".facebook.com")
         log("usando cookies de conta (FB_COOKIES)")
+    elif config.get("sem_login", {}).get("ativo"):
+        log("modo SEM LOGIN (busca por coordenadas)")
 
     agora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     limite_data = None
@@ -446,9 +534,13 @@ def rodar(teste: bool = False, enviar_atuais: bool = False) -> None:
         encontrados: dict = {}
         lidos_busca = 0
         for termo in busca["termos_busca"]:
-            url = montar_url(config["local"], termo, config.get("raio_km", 10))
+            usar_graphql = bool(config.get("sem_login", {}).get("ativo")) and not cookies
             log(f"buscando '{termo}'")
-            anuncios, bloqueado = buscar(sessao, url)
+            if usar_graphql:
+                anuncios, bloqueado = buscar_graphql(sessao, config, termo)
+            else:
+                url = montar_url(config["local"], termo, config.get("raio_km", 10))
+                anuncios, bloqueado = buscar(sessao, url)
             algum_bloqueio |= bloqueado
             lidos_busca += len(anuncios)
             total_lidos += len(anuncios)
