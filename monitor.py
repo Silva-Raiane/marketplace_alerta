@@ -255,28 +255,59 @@ def pegar_lsd(sessao: requests.Session) -> str:
     return _LSD["v"]
 
 
-def buscar_graphql(sessao: requests.Session, config: dict, termo: str) -> tuple[list[dict], bool]:
+def _variaveis_graphql(config: dict, termo: str, ordenar: bool) -> dict:
     g = config["sem_login"]
-    variaveis = {
+    raio = config.get("raio_km", 10)
+    modelo = g.get("variables")
+    if modelo:  # copiado do navegador (F12 > Network > graphql > Payload > variables)
+        v = json.loads(modelo) if isinstance(modelo, str) else json.loads(json.dumps(modelo))
+
+        def trocar(o):
+            if isinstance(o, dict):
+                for k in list(o):
+                    if k == "query" and isinstance(o[k], str):
+                        o[k] = termo
+                    elif k in ("filter_location_latitude", "latitude"):
+                        o[k] = g["latitude"]
+                    elif k in ("filter_location_longitude", "longitude"):
+                        o[k] = g["longitude"]
+                    elif k == "filter_radius_km":
+                        o[k] = raio
+                    else:
+                        trocar(o[k])
+            elif isinstance(o, list):
+                for x in o:
+                    trocar(x)
+        trocar(v)
+        v.pop("cursor", None)
+        return v
+    brp = {
+        "commerce_enable_local_pickup": True,
+        "commerce_enable_shipping": True,
+        "commerce_search_and_rp_available": True,
+        "commerce_search_and_rp_condition": None,
+        "commerce_search_and_rp_ctime_days": None,
+        "filter_location_latitude": g["latitude"],
+        "filter_location_longitude": g["longitude"],
+        "filter_price_lower_bound": 0,
+        "filter_price_upper_bound": 214748364700,
+        "filter_radius_km": raio,
+    }
+    if ordenar:
+        brp["commerce_search_sort_by"] = "CREATION_TIME_DESCEND"
+    return {
         "count": 24,
         "params": {
             "bqf": {"callsite": "COMMERCE_MKTPLACE_WWW", "query": termo},
-            "browse_request_params": {
-                "commerce_enable_local_pickup": True,
-                "commerce_enable_shipping": True,
-                "commerce_search_and_rp_available": True,
-                "commerce_search_and_rp_condition": None,
-                "commerce_search_and_rp_ctime_days": None,
-                "commerce_search_sort_by": "CREATION_TIME_DESCEND",
-                "filter_location_latitude": g["latitude"],
-                "filter_location_longitude": g["longitude"],
-                "filter_price_lower_bound": 0,
-                "filter_price_upper_bound": 214748364700,
-                "filter_radius_km": config.get("raio_km", 10),
-            },
+            "browse_request_params": brp,
             "custom_request_params": {"surface": "SEARCH"},
         },
     }
+
+
+def _post_graphql(sessao, config, variaveis):
+    g = config["sem_login"]
+    nome = g.get("friendly_name", "CometMarketplaceSearchContentPaginationQuery")
     lsd = pegar_lsd(sessao)
     headers = dict(HEADERS)
     headers.update({
@@ -287,21 +318,17 @@ def buscar_graphql(sessao: requests.Session, config: dict, termo: str) -> tuple[
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
         "X-FB-LSD": lsd,
-        "X-FB-Friendly-Name": "CometMarketplaceSearchContentPaginationQuery",
+        "X-FB-Friendly-Name": nome,
     })
     dados = {
         "av": "0", "__user": "0", "__a": "1", "lsd": lsd,
         "fb_api_caller_class": "RelayModern",
-        "fb_api_req_friendly_name": "CometMarketplaceSearchContentPaginationQuery",
+        "fb_api_req_friendly_name": nome,
         "server_timestamps": "true",
         "variables": json.dumps(variaveis),
         "doc_id": str(g["doc_id"]),
     }
-    try:
-        r = sessao.post(GRAPHQL_URL, headers=headers, data=dados, timeout=30)
-    except requests.RequestException as e:
-        log(f"  erro de rede: {e}")
-        return [], False
+    r = sessao.post(GRAPHQL_URL, headers=headers, data=dados, timeout=30)
     achados: dict = {}
     texto = r.text.removeprefix("for (;;);")
     for linha in texto.splitlines():
@@ -309,11 +336,22 @@ def buscar_graphql(sessao: requests.Session, config: dict, termo: str) -> tuple[
             _percorrer(json.loads(linha), achados)
         except json.JSONDecodeError:
             continue
-    anuncios = montar_anuncios(achados)
-    if not anuncios:
-        log(f"  GraphQL status {r.status_code}: {texto[:250]}")
-    return anuncios, (not anuncios and r.status_code in (401, 403))
+    return montar_anuncios(achados), r.status_code, texto
 
+
+def buscar_graphql(sessao: requests.Session, config: dict, termo: str) -> tuple[list[dict], bool]:
+    tentativas = [True] if config["sem_login"].get("variables") else [True, False]
+    status, texto = 0, ""
+    for ordenar in tentativas:  # se vier vazio ordenado, tenta sem ordenar
+        try:
+            anuncios, status, texto = _post_graphql(sessao, config, _variaveis_graphql(config, termo, ordenar))
+        except requests.RequestException as e:
+            log(f"  erro de rede: {e}")
+            return [], False
+        if anuncios:
+            return anuncios, False
+    log(f"  GraphQL status {status}: {texto[:250]}")
+    return [], status in (401, 403)
 
 
 def buscar(sessao: requests.Session, url: str) -> tuple[list[dict], bool]:
